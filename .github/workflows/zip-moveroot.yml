@@ -1,4 +1,4 @@
-name: Unpack ZIP and Build APK
+name: Unpack ZIP and Flatten to Root
 
 on:
   push:
@@ -8,23 +8,37 @@ on:
       zip_file:
         description: '要解压的 ZIP 文件名（例如 "archive.zip"）'
         required: false
-        default: 'github-uploader.zip'
+        default: ''
       subdir:
-        description: '要移动到根目录的子目录名（可选）'
+        description: '要移动到根目录的子目录名（可选，仅用于提升现有子目录）'
         required: false
-        default: 'github-uploader.zip'
+        default: ''
 
 jobs:
-  unpack-and-build:
+  unpack-and-move:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # 只需要写入仓库内容，不需要 workflows 权限
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
 
-      # ========== 1. 解压 ZIP 并移动子目录到根目录 ==========
-      - name: 自动解压（仅当只有一个 ZIP 文件）
+      # 输入验证：防止将 ZIP 文件名误填到 subdir
+      - name: 验证输入参数
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ -n "${{ inputs.subdir }}" ] && [[ "${{ inputs.subdir }}" == *.zip ]]; then
+            echo "❌ 错误：subdir 参数不能是 ZIP 文件名。"
+            echo "您可能想使用 'zip_file' 参数来解压 ZIP 文件。"
+            echo "请重新运行 workflow，将 ZIP 文件名填入 'zip_file' 字段，清空 'subdir' 字段。"
+            exit 1
+          fi
+          if [ -z "${{ inputs.zip_file }}" ] && [ -z "${{ inputs.subdir }}" ]; then
+            echo "⚠️ 未指定 zip_file 或 subdir，workflow 将不会执行任何操作。"
+            exit 0
+          fi
+
+      - name: 自动解压（仅当只有一个 ZIP 文件且为 push 事件）
         if: github.event_name == 'push'
         run: |
           shopt -s dotglob
@@ -94,56 +108,26 @@ jobs:
           rm -f "$zipfile"
           echo "✅ 解压并移动完成"
 
-      - name: 移动手动指定的子目录到根目录（独立于 ZIP）
+      - name: 移动手动指定的子目录到根目录
         if: github.event_name == 'workflow_dispatch' && inputs.subdir != ''
         run: |
           shopt -s dotglob
           SUBDIR="${{ inputs.subdir }}"
-          if [ -d "$SUBDIR" ]; then
-            echo "移动子目录 '$SUBDIR' 的内容到根目录"
-            cp -r "$SUBDIR"/. .
-            rm -rf "$SUBDIR"
-            echo "✅ 子目录已提升到根目录"
-          else
+          if [ ! -d "$SUBDIR" ]; then
             echo "错误：子目录 '$SUBDIR' 不存在"
+            echo "当前目录下的子目录："
+            ls -d */ 2>/dev/null || echo "（无）"
             exit 1
           fi
+          echo "移动子目录 '$SUBDIR' 的内容到根目录"
+          cp -r "$SUBDIR"/. .
+          rm -rf "$SUBDIR"
+          echo "✅ 子目录已提升到根目录"
 
-      # ========== 2. 提交更改（排除 .github 目录，避免 workflow 权限错误） ==========
       - name: 提交更改
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 添加所有更改，但排除 .github 文件夹
-          git add . -- ':!.github'
+          git add .
           git diff --staged --quiet || git commit -m "自动解压 ZIP 并整理目录结构"
           git push
-
-      # ========== 3. 构建 Android APK ==========
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: 'gradle'
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.5'
-
-      - name: Remove hardcoded Java home in gradle.properties
-        run: |
-          if [ -f gradle.properties ]; then
-            sed -i '/org.gradle.java.home/d' gradle.properties
-          fi
-
-      - name: Build APK
-        run: gradle assembleDebug --stacktrace --no-daemon
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
-          retention-days: 7

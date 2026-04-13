@@ -8,9 +8,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -35,6 +33,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import com.google.gson.GsonBuilder
+import com.google.gson.annotations.SerializedName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -50,6 +49,7 @@ import java.util.*
 
 // ==================== GitHub API 接口定义 ====================
 interface GithubApi {
+    // 获取文件信息
     @GET("repos/{owner}/{repo}/contents/{path}")
     suspend fun getFile(
         @Path("owner") owner: String,
@@ -59,6 +59,7 @@ interface GithubApi {
         @Header("Authorization") token: String
     ): Response<GithubContentResponse>
 
+    // 创建或更新文件
     @PUT("repos/{owner}/{repo}/contents/{path}")
     suspend fun createOrUpdateFile(
         @Path("owner") owner: String,
@@ -67,6 +68,29 @@ interface GithubApi {
         @Header("Authorization") token: String,
         @Body body: CreateFileRequest
     ): Response<GithubFileResponse>
+
+    // 创建新仓库
+    @POST("user/repos")
+    suspend fun createRepository(
+        @Header("Authorization") token: String,
+        @Body body: CreateRepoRequest
+    ): Response<RepositoryResponse>
+
+    // ========== 数据类 ==========
+    data class CreateRepoRequest(
+        val name: String,
+        val description: String? = null,
+        val private: Boolean = true,
+        @SerializedName("auto_init") val autoInit: Boolean = false
+    )
+
+    data class RepositoryResponse(
+        val id: Long,
+        val name: String,
+        @SerializedName("full_name") val fullName: String,
+        @SerializedName("html_url") val htmlUrl: String,
+        @SerializedName("default_branch") val defaultBranch: String
+    )
 
     data class CreateFileRequest(
         val message: String,
@@ -90,18 +114,35 @@ interface GithubApi {
 }
 
 // ==================== 内置 YML 文件内容 ====================
-// 暂时注释掉这些字符串以避免编译错误
-// 实际使用时可以取消注释
-val DEFAULT_UNPACK_YML = ""
-val DEFAULT_BUILD_YML = ""
+// 实际使用时请填入完整的 workflow 内容
+val DEFAULT_UNPACK_YML = """
+name: Unzip and Move Root
+on: [push]
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Unzip
+        run: unzip *.zip -d output
+""".trimIndent()
+
+val DEFAULT_BUILD_YML = """
+name: Build Android APK
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build
+        run: ./gradlew assembleRelease
+""".trimIndent()
 
 // ==================== 主题颜色 ====================
 private val Purple80 = Color(0xFFD0BCFF)
 private val PurpleGrey80 = Color(0xFFCCC2DC)
 private val Pink80 = Color(0xFFEFB8C8)
-private val Purple40 = Color(0xFF6650a4)
-private val PurpleGrey40 = Color(0xFF625b71)
-private val Pink40 = Color(0xFF7D5260)
 private val SuccessGreen = Color(0xFF4CAF50)
 private val ErrorRed = Color(0xFFE53935)
 private val WarningOrange = Color(0xFFFF9800)
@@ -153,9 +194,19 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun UploadScreen(api: GithubApi, context: MainActivity) {
+    // 模式选择：false = 使用现有仓库，true = 创建新仓库
+    var createNewRepo by remember { mutableStateOf(false) }
+
+    // 现有仓库输入
     var repoUrl by remember { mutableStateOf("") }
-    var token by remember { mutableStateOf("") }
     var branch by remember { mutableStateOf("main") }
+
+    // 新仓库输入
+    var newRepoName by remember { mutableStateOf("") }
+    var newRepoDesc by remember { mutableStateOf("") }
+    var newRepoPrivate by remember { mutableStateOf(true) }
+
+    var token by remember { mutableStateOf("") }
     var uploadDefaultUnpack by remember { mutableStateOf(true) }
     var uploadDefaultBuild by remember { mutableStateOf(true) }
     val customYmlFiles = remember { mutableStateListOf<Pair<Uri, String>>() }
@@ -167,7 +218,7 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
 
     val listState = rememberLazyListState()
 
-    // 保存/加载 token 和 repo 的 SharedPreferences
+    // SharedPreferences 读写
     val prefs = context.getSharedPreferences("github_uploader", Context.MODE_PRIVATE)
     LaunchedEffect(Unit) {
         token = prefs.getString("token", "") ?: ""
@@ -175,6 +226,10 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
         branch = prefs.getString("branch", "main") ?: "main"
         uploadDefaultUnpack = prefs.getBoolean("upload_default_unpack", true)
         uploadDefaultBuild = prefs.getBoolean("upload_default_build", true)
+        createNewRepo = prefs.getBoolean("create_new_repo", false)
+        newRepoName = prefs.getString("new_repo_name", "") ?: ""
+        newRepoDesc = prefs.getString("new_repo_desc", "") ?: ""
+        newRepoPrivate = prefs.getBoolean("new_repo_private", true)
     }
 
     fun savePrefs() {
@@ -184,6 +239,10 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
             .putString("branch", branch)
             .putBoolean("upload_default_unpack", uploadDefaultUnpack)
             .putBoolean("upload_default_build", uploadDefaultBuild)
+            .putBoolean("create_new_repo", createNewRepo)
+            .putString("new_repo_name", newRepoName)
+            .putString("new_repo_desc", newRepoDesc)
+            .putBoolean("new_repo_private", newRepoPrivate)
             .apply()
     }
 
@@ -291,12 +350,16 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
     // 上传逻辑
     fun startUpload() {
         if (isUploading) return
-        if (repoUrl.isBlank()) {
+        if (token.isBlank()) {
+            addLog("⚠ 请输入 GitHub Token")
+            return
+        }
+        if (!createNewRepo && repoUrl.isBlank()) {
             addLog("⚠ 请输入仓库地址")
             return
         }
-        if (token.isBlank()) {
-            addLog("⚠ 请输入 GitHub Token")
+        if (createNewRepo && newRepoName.isBlank()) {
+            addLog("⚠ 请输入新仓库名称")
             return
         }
 
@@ -305,23 +368,54 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
 
         context.lifecycleScope.launch {
             try {
-                val (owner, repo) = parseRepo(repoUrl)
-                    ?: throw Exception("仓库地址格式错误，请检查格式")
+                var owner: String
+                var repo: String
+                var targetBranch: String
 
-                addLog("📦 仓库: $owner/$repo")
-                addLog("🌿 分支: $branch")
+                if (createNewRepo) {
+                    // 创建新仓库
+                    addLog("📦 正在创建仓库: $newRepoName")
+                    val createResponse = api.createRepository(
+                        "token $token",
+                        GithubApi.CreateRepoRequest(
+                            name = newRepoName,
+                            description = newRepoDesc.takeIf { it.isNotBlank() },
+                            private = newRepoPrivate,
+                            autoInit = false
+                        )
+                    )
+                    if (!createResponse.isSuccessful) {
+                        val error = createResponse.errorBody()?.string() ?: "Unknown error"
+                        throw Exception("创建仓库失败: ${createResponse.code()} - $error")
+                    }
+                    val repoData = createResponse.body()!!
+                    owner = repoData.fullName.substringBefore('/')
+                    repo = repoData.name
+                    targetBranch = repoData.defaultBranch
+                    addLog("✅ 仓库创建成功: ${repoData.htmlUrl}")
+                } else {
+                    // 使用现有仓库
+                    val parsed = parseRepo(repoUrl)
+                        ?: throw Exception("仓库地址格式错误，请检查格式")
+                    owner = parsed.first
+                    repo = parsed.second
+                    targetBranch = branch
+                    addLog("📦 仓库: $owner/$repo")
+                }
 
-                // 1. 上传默认的 workflow（如果勾选）
+                addLog("🌿 分支: $targetBranch")
+
+                // 1. 上传默认的 workflow
                 if (uploadDefaultUnpack) {
                     addLog("📤 上传 zip-moveroot.yml ...")
-                    uploadYmlContent(owner, repo, "zip-moveroot.yml", DEFAULT_UNPACK_YML, api, token, branch) { addLog(it) }
+                    uploadYmlContent(owner, repo, "zip-moveroot.yml", DEFAULT_UNPACK_YML, api, token, targetBranch) { addLog(it) }
                 } else {
                     addLog("⏭ 跳过 zip-moveroot.yml")
                 }
 
                 if (uploadDefaultBuild) {
                     addLog("📤 上传 build.yml ...")
-                    uploadYmlContent(owner, repo, "build.yml", DEFAULT_BUILD_YML, api, token, branch) { addLog(it) }
+                    uploadYmlContent(owner, repo, "build.yml", DEFAULT_BUILD_YML, api, token, targetBranch) { addLog(it) }
                 } else {
                     addLog("⏭ 跳过 build.yml")
                 }
@@ -335,7 +429,7 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
                         try {
                             val contentBase64 = readFileAsBase64(uri)
                             val remotePath = ".github/workflows/$filename"
-                            uploadFile(api, owner, repo, remotePath, contentBase64, token, branch) { addLog(it) }
+                            uploadFile(api, owner, repo, remotePath, contentBase64, token, targetBranch) { addLog(it) }
                         } catch (e: Exception) {
                             addLog("✗ $filename 读取失败: ${e.message}")
                         }
@@ -347,7 +441,7 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
                     addLog("📤 上传 ZIP: $zipFileName ...")
                     try {
                         val contentBase64 = readFileAsBase64(uri)
-                        uploadFile(api, owner, repo, zipFileName, contentBase64, token, branch) { addLog(it) }
+                        uploadFile(api, owner, repo, zipFileName, contentBase64, token, targetBranch) { addLog(it) }
                     } catch (e: Exception) {
                         addLog("✗ ZIP 读取失败: ${e.message}")
                     }
@@ -393,8 +487,6 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
         }
     }
 
-    var showSettings by remember { mutableStateOf(false) }
-
     Scaffold(
         topBar = {
             TopAppBar(
@@ -409,96 +501,137 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
                         Text("GitHub Workflow 上传工具", fontWeight = FontWeight.Bold)
                     }
                 },
-                actions = {
-                    IconButton(onClick = { showSettings = true }) {
-                        Icon(
-                            imageVector = Icons.Default.Delete,
-                            contentDescription = "设置"
-                        )
-                    }
-                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer,
                     titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
                 )
             )
         }
-    ) {
-        if (showSettings) {
-            AlertDialog(
-                onDismissRequest = { showSettings = false },
-                title = { Text("设置") },
-                text = {
-                    Column(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        // Token 输入
-                        OutlinedTextField(
-                            value = token,
-                            onValueChange = {
-                                token = it
-                                savePrefs()
-                            },
-                            label = { Text("GitHub Token") },
-                            placeholder = { Text("ghp_xxxxxxxxxxxx") },
-                            leadingIcon = {
-                                Icon(Icons.Default.Delete, contentDescription = null)
-                            },
-                            trailingIcon = {
-                                IconButton(onClick = { tokenVisible = !tokenVisible }) {
-                                    Text(if (tokenVisible) "隐藏" else "显示")
-                                }
-                            },
-                            visualTransformation = if (tokenVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        // 分支输入
-                        OutlinedTextField(
-                            value = branch,
-                            onValueChange = {
-                                branch = it
-                                savePrefs()
-                            },
-                            label = { Text("分支名") },
-                            placeholder = { Text("默认 main") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    }
-                },
-                confirmButton = {
-                    TextButton(onClick = { showSettings = false }) {
-                        Text("保存")
-                    }
-                }
-            )
-        }
-
+    ) { paddingValues ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(it)
+                .padding(paddingValues)
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // 仓库地址输入
+            // 模式选择
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    RadioButton(
+                        selected = !createNewRepo,
+                        onClick = {
+                            createNewRepo = false
+                            savePrefs()
+                        }
+                    )
+                    Text("使用现有仓库")
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    RadioButton(
+                        selected = createNewRepo,
+                        onClick = {
+                            createNewRepo = true
+                            savePrefs()
+                        }
+                    )
+                    Text("创建新仓库")
+                }
+            }
+
+            // Token 输入
             OutlinedTextField(
-                value = repoUrl,
+                value = token,
                 onValueChange = {
-                    repoUrl = it
+                    token = it
                     savePrefs()
                 },
-                label = { Text("仓库地址 (GitHub URL)") },
-                placeholder = { Text("例如: https://github.com/user/repo") },
+                label = { Text("GitHub Token") },
+                placeholder = { Text("ghp_xxxxxxxxxxxx") },
                 leadingIcon = {
                     Icon(Icons.Default.Delete, contentDescription = null)
                 },
+                trailingIcon = {
+                    IconButton(onClick = { tokenVisible = !tokenVisible }) {
+                        Text(if (tokenVisible) "隐藏" else "显示")
+                    }
+                },
+                visualTransformation = if (tokenVisible) VisualTransformation.None else PasswordVisualTransformation(),
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )
+
+            // 根据模式显示不同输入
+            if (createNewRepo) {
+                // 新仓库输入
+                OutlinedTextField(
+                    value = newRepoName,
+                    onValueChange = {
+                        newRepoName = it
+                        savePrefs()
+                    },
+                    label = { Text("仓库名称") },
+                    placeholder = { Text("例如: my-new-repo") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = newRepoDesc,
+                    onValueChange = {
+                        newRepoDesc = it
+                        savePrefs()
+                    },
+                    label = { Text("描述 (可选)") },
+                    placeholder = { Text("仓库描述") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(
+                        checked = newRepoPrivate,
+                        onCheckedChange = {
+                            newRepoPrivate = it
+                            savePrefs()
+                        }
+                    )
+                    Text("私有仓库")
+                }
+            } else {
+                // 现有仓库输入
+                OutlinedTextField(
+                    value = repoUrl,
+                    onValueChange = {
+                        repoUrl = it
+                        savePrefs()
+                    },
+                    label = { Text("仓库地址 (GitHub URL)") },
+                    placeholder = { Text("例如: https://github.com/user/repo") },
+                    leadingIcon = {
+                        Icon(Icons.Default.Delete, contentDescription = null)
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // 分支输入
+                OutlinedTextField(
+                    value = branch,
+                    onValueChange = {
+                        branch = it
+                        savePrefs()
+                    },
+                    label = { Text("分支名") },
+                    placeholder = { Text("默认 main") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
 
             // 分隔线
             Divider(modifier = Modifier.padding(vertical = 4.dp))
@@ -510,58 +643,54 @@ fun UploadScreen(api: GithubApi, context: MainActivity) {
                 fontWeight = FontWeight.Bold
             )
 
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant
-                )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .padding(12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Column(
-                    modifier = Modifier.padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Checkbox(
-                                checked = uploadDefaultUnpack,
-                                onCheckedChange = {
-                                    uploadDefaultUnpack = it
-                                    savePrefs()
-                                }
-                            )
-                            Text("zip-moveroot.yml", modifier = Modifier.padding(start = 4.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = uploadDefaultUnpack,
+                        onCheckedChange = {
+                            uploadDefaultUnpack = it
+                            savePrefs()
                         }
-                        Text(
-                            "自动解压 ZIP",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Checkbox(
-                                checked = uploadDefaultBuild,
-                                onCheckedChange = {
-                                    uploadDefaultBuild = it
-                                    savePrefs()
-                                }
-                            )
-                            Text("build.yml", modifier = Modifier.padding(start = 4.dp))
-                        }
-                        Text(
-                            "构建 Android APK",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
+                    )
+                    Text("zip-moveroot.yml", modifier = Modifier.padding(start = 4.dp))
                 }
+                Text(
+                    "自动解压 ZIP",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .padding(12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = uploadDefaultBuild,
+                        onCheckedChange = {
+                            uploadDefaultBuild = it
+                            savePrefs()
+                        }
+                    )
+                    Text("build.yml", modifier = Modifier.padding(start = 4.dp))
+                }
+                Text(
+                    "构建 Android APK",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
 
             // 自定义文件选择按钮
